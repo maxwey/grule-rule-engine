@@ -17,6 +17,8 @@ import "github.com/DataWiseHQ/grule-rule-engine"
 
 **Grule** is a Rule Engine library for the Go (Golang) programming language. Inspired by the acclaimed JBOSS Drools, and done in a much simpler manner.
 
+This project is a fork of the original `Grule` project by `hyperjumptech` which is no longer maintained.
+
 Like **Drools**, **Grule** has its own *DSL* or Domain-Specific Language.
 
 Below is an example of Drools's DRL or Drools Rule Language:

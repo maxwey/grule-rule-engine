@@ -17,6 +17,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/DataWiseHQ/grule-rule-engine/engine/conflict"
 	"github.com/rs/zerolog"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
@@ -124,7 +125,7 @@ func (g *GruleEngine) notifyBeginCycle(cycle uint64) {
 }
 
 // ExecuteWithContext function will execute a knowledge evaluation and action against data context.
-// The engine will evaluate context cancelation status in each cycle.
+// The engine will evaluate context cancellation status in each cycle.
 // The engine also do conflict resolution of which rule to execute.
 func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataContext, knowledge *ast.KnowledgeBase) error {
 	if knowledge == nil || dataCtx == nil {
@@ -160,6 +161,7 @@ func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataC
 	knowledge.InitializeContext(dataCtx)
 
 	var cycle uint64
+	var conflictSet conflict.Set = &conflict.SalienceStrategy{}
 
 	/*
 		Un-limited loop as long as there are rule to execute.
@@ -177,7 +179,7 @@ func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataC
 
 		// Select all rule entry that can be executed.
 		log.Tracef("Select all rule entry that can be executed.")
-		runnable := make([]*ast.RuleEntry, 0)
+		conflictSet.Clear()
 		for _, ruleEntry := range knowledge.RuleEntries {
 			if ctx.Err() != nil {
 				log.Error("Context canceled")
@@ -194,61 +196,51 @@ func (g *GruleEngine) ExecuteWithContext(ctx context.Context, dataCtx ast.IDataC
 						return err
 					}
 				}
-				// if can, add into runnable array
+				// if can, add to conflict set
 				if can {
-					runnable = append(runnable, ruleEntry)
+					conflictSet.AddCandidate(ruleEntry)
 				}
-				// notify all listeners that a rule's when scope is been evaluated.
+				// notify all listeners that a rule's 'when' scope was evaluated.
 				g.notifyEvaluateRuleEntry(cycle+1, ruleEntry, can)
 			}
 		}
 
 		// disabled to test the rete's variable change detection.
 		// knowledge.RuleContextReset()
-		log.Tracef("Selected rules %d.", len(runnable))
+		log.Tracef("Selected rules %d.", conflictSet.TotalCandidates())
 
-		// If there are rules to execute, sort them by their Salience
-		if len(runnable) > 0 {
-			// add the cycle counter
-			cycle++
-
-			log.Debugf("Cycle #%d", cycle)
-			// if cycle is above the maximum allowed cycle, returnan error indicated the cycle has ended.
-			if cycle > g.MaxCycle {
-				log.Error("Max cycle reached")
-
-				return fmt.Errorf("the GruleEngine successfully selected rule candidate for execution after %d cycles, this could possibly caused by rule entry(s) that keep added into execution pool but when executed it does not change any data in context. Please evaluate your rule entries \"When\" and \"Then\" scope. You can adjust the maximum cycle using GruleEngine.MaxCycle variable", g.MaxCycle)
-			}
-
-			runner := runnable[0]
-
-			// scan all runnables and pick the highest salience
-			if len(runnable) > 1 {
-				for idx, pr := range runnable {
-					if idx > 0 && runner.Salience < pr.Salience {
-						runner = pr
-					}
-				}
-			}
-			// set the current rule entry to run. This is for trace ability purpose
-			dataCtx.SetRuleEntry(runner)
-			// notify listeners that we are about to execute a rule entry then scope
-			g.notifyExecuteRuleEntry(cycle, runner)
-			// execute the top most prioritized rule
-			err := runner.Execute(ctx, dataCtx, knowledge.WorkingMemory)
-			if err != nil {
-				log.Errorf("Failed execution rule : %s. Got error %v", runner.RuleName, err)
-
-				return fmt.Errorf("error while executing rule %s. got %w", runner.RuleName, err)
-			}
-
-			if dataCtx.IsComplete() {
-				break
-			}
-		} else {
+		if conflictSet.TotalCandidates() == 0 {
 			// No more rule can be executed, so we are done here.
 			log.Debugf("No more rule to run")
 
+			break
+		}
+
+		// add the cycle counter
+		cycle++
+		log.Debugf("Cycle #%d", cycle)
+		// if cycle is above the maximum allowed cycle, return an error indicated the cycle has ended.
+		if cycle > g.MaxCycle {
+			log.Error("Max cycle reached")
+
+			return fmt.Errorf("the GruleEngine successfully selected rule candidate for execution after %d cycles, this could possibly caused by rule entry(s) that keep added into execution pool but when executed it does not change any data in context. Please evaluate your rule entries \"When\" and \"Then\" scope. You can adjust the maximum cycle using GruleEngine.MaxCycle variable", g.MaxCycle)
+		}
+
+		// select the rule to be run
+		selectedRule := conflictSet.Resolve()
+		// set the current rule entry to run. This is for trace ability purpose
+		dataCtx.SetRuleEntry(selectedRule)
+		// notify listeners that we are about to execute a rule entry's 'then' scope
+		g.notifyExecuteRuleEntry(cycle, selectedRule)
+		// execute the top most prioritized rule
+		err := selectedRule.Execute(ctx, dataCtx, knowledge.WorkingMemory)
+		if err != nil {
+			log.Errorf("Failed execution rule : %s. Got error %v", selectedRule.RuleName, err)
+
+			return fmt.Errorf("error while executing rule %s. got %w", selectedRule.RuleName, err)
+		}
+
+		if dataCtx.IsComplete() {
 			break
 		}
 	}
